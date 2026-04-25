@@ -10,10 +10,9 @@ import (
 type Callback[R any] func(ctx context.Context, result R, error error)
 
 type TaskInput[T any, R any] struct {
-	Payload  T
-	Result   chan Result[R]
-	Callback Callback[R]
-	Context  context.Context
+	Payload T
+	Result  chan Result[R]
+	Context context.Context
 }
 
 type Result[R any] struct {
@@ -57,7 +56,8 @@ type FastQueue[T any, R any] struct {
 	cancel          context.CancelFunc
 
 	// wait group for queue completed
-	wgQueue sync.WaitGroup
+	wgQueue  sync.WaitGroup
+	sendTail chan struct{}
 
 	// atomic counters
 	pending   int32
@@ -163,7 +163,7 @@ func (q *FastQueue[T, R]) worker(workerID int) {
 	}
 }
 
-func (q *FastQueue[T, R]) Push(ctx context.Context, payload T, callback Callback[R]) (R, error) {
+func (q *FastQueue[T, R]) PushAndWait(ctx context.Context, payload T) (R, error) {
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
@@ -183,7 +183,7 @@ func (q *FastQueue[T, R]) Push(ctx context.Context, payload T, callback Callback
 	// Stop races in and wins the send select, surface that as a task-level
 	// cancellation rather than ErrQueueStopped.
 	select {
-	case q.input <- TaskInput[T, R]{Payload: payload, Result: resultChan, Callback: callback, Context: ctx}:
+	case q.input <- TaskInput[T, R]{Payload: payload, Result: resultChan, Context: ctx}:
 	case <-q.stoppedChan:
 		q.wgQueue.Done()
 		atomic.AddInt32(&q.pending, -1)
@@ -194,19 +194,10 @@ func (q *FastQueue[T, R]) Push(ctx context.Context, payload T, callback Callback
 	// Task is committed. A worker delivers the real result, or Stop's drain
 	// (running concurrently with pushWaitGroup.Wait) delivers ErrTaskCancelled.
 	result := <-resultChan
-
-	if callback != nil {
-		callbackContext := ctx
-		if callbackContext == nil {
-			callbackContext = q.ctx
-		}
-		go callback(callbackContext, result.Result, result.Error)
-	}
-
 	return result.Result, result.Error
 }
 
-func (q *FastQueue[T, R]) PushWithoutResult(ctx context.Context, payload T) error {
+func (q *FastQueue[T, R]) PushWithCallback(ctx context.Context, payload T, callback Callback[R]) error {
 	q.mu.Lock()
 	if q.stopped {
 		q.mu.Unlock()
@@ -216,27 +207,100 @@ func (q *FastQueue[T, R]) PushWithoutResult(ctx context.Context, payload T) erro
 	q.pushWaitGroup.Add(1)
 	q.wgQueue.Add(1)
 	atomic.AddInt32(&q.pending, 1)
+
+	prev := q.sendTail
+	myPushTask := make(chan struct{})
+	q.sendTail = myPushTask
+
 	q.mu.Unlock()
 
-	defer q.pushWaitGroup.Done()
+	resultChan := make(chan Result[R], 1)
 
-	select {
-	case q.input <- TaskInput[T, R]{Payload: payload, Result: nil, Callback: nil, Context: ctx}:
-		return nil
-	case <-q.stoppedChan:
-		// send error means worker is stopped and task is not executed need to decrement pending and failed
-		q.wgQueue.Done()
-		atomic.AddInt32(&q.pending, -1)
-		return ErrQueueStopped
-	}
+	go func() {
+		defer q.pushWaitGroup.Done()
+
+		// wait previous enqueue operation completed
+		if prev != nil {
+			<-prev
+		}
+		close(myPushTask)
+
+		select {
+		case q.input <- TaskInput[T, R]{Payload: payload, Result: resultChan, Context: ctx}:
+		case <-q.stoppedChan:
+			q.wgQueue.Done()
+			atomic.AddInt32(&q.pending, -1)
+			atomic.AddInt32(&q.failed, 1)
+			if callback != nil {
+				callback(ctx, *new(R), ErrTaskCancelled)
+			}
+			return
+		}
+
+		if callback != nil {
+			result := <-resultChan
+			callback(ctx, result.Result, result.Error)
+		}
+	}()
+
+	return nil
 }
 
-func (q *FastQueue[T, R]) Drained() {
+func (q *FastQueue[T, R]) PushWithoutResult(ctx context.Context, payload T) error {
+	// q.keepOrder <- struct{}{}
+	q.mu.Lock()
+	if q.stopped {
+		q.mu.Unlock()
+		return ErrQueueStopped
+	}
+
+	q.pushWaitGroup.Add(1)
+	q.wgQueue.Add(1)
+	atomic.AddInt32(&q.pending, 1)
+
+	// keep the push operation in order
+	prev := q.sendTail
+	myPushTask := make(chan struct{})
+	q.sendTail = myPushTask
+
+	q.mu.Unlock()
+
+	go func() {
+		defer q.pushWaitGroup.Done()
+		defer close(myPushTask)
+
+		// wait previous enqueue operation completed
+		if prev != nil {
+			<-prev
+		}
+
+		select {
+		case q.input <- TaskInput[T, R]{Payload: payload, Result: nil, Context: ctx}:
+		case <-q.stoppedChan:
+			// send error means worker is stopped and task is not executed need to decrement pending and failed
+			q.wgQueue.Done()
+			atomic.AddInt32(&q.pending, -1)
+			atomic.AddInt32(&q.failed, 1)
+		}
+	}()
+
+	return nil
+}
+
+func (q *FastQueue[T, R]) WaitEmpty() {
 	q.wgQueue.Wait()
 }
 
 func (q *FastQueue[T, R]) Pending() int {
 	return int(atomic.LoadInt32(&q.pending))
+}
+
+func (q *FastQueue[T, R]) Completed() int {
+	return int(atomic.LoadInt32(&q.completed))
+}
+
+func (q *FastQueue[T, R]) Failed() int {
+	return int(atomic.LoadInt32(&q.failed))
 }
 
 func (q *FastQueue[T, R]) Pause() {
@@ -318,23 +382,20 @@ func (q *FastQueue[T, R]) Status() QueueStats {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
-	pending := int(atomic.LoadInt32(&q.completed))
-
-	status := Running
-	if q.stopped {
-		status = Stopped
-	} else if q.paused {
-		status = Paused
-	} else if pending == 0 {
-		status = Ready
-	}
-
-	return QueueStats{
-		Pending:   pending,
+	status := QueueStats{
+		Pending:   int(atomic.LoadInt32(&q.pending)),
 		Completed: int(atomic.LoadInt32(&q.completed)),
 		Failed:    int(atomic.LoadInt32(&q.failed)),
-		Status:    status,
 	}
+
+	if q.stopped {
+		status.Status = Stopped
+	} else if q.paused {
+		status.Status = Paused
+	} else if status.Pending == 0 {
+		status.Status = Ready
+	}
+	return status
 }
 
 func (q *FastQueue[T, R]) Clear() {
@@ -372,15 +433,19 @@ func (q *FastQueue[T, R]) Clear() {
  **/
 type Queue interface {
 	Pending() int
-	NumberOfWorkers() int
-	Drained()
+	Completed() int
+	Failed() int
+	Status() QueueStats
 
 	Pause()
 	Resume()
 	Clear()
 	Stop()
 
-	Status() QueueStats
+	/**
+	* WaitEmpty waits for all tasks to be completed
+	 */
+	WaitEmpty()
 }
 
 var _ Queue = &FastQueue[any, any]{}
