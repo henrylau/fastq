@@ -217,6 +217,13 @@ func (q *FastQueue[T, R]) Failed()    int
 func (q *FastQueue[T, R]) Status()    QueueStats
 ```
 
+## AI assistance
+
+Parts of this project's documentation, test cases, and examples were drafted
+with the help of an AI assistant. Every AI-drafted change was reviewed,
+edited, and accepted by the maintainer before being committed; the core
+library code is human-authored.
+
 ## License
 
 MIT.
