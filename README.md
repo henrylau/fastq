@@ -13,42 +13,79 @@ Bare goroutines have no concurrency cap. Custom semaphore patterns work but leak
 
 ## Quick start
 
+Push 10 tasks into a pool of 4 workers. Each `PushAndWait` call blocks until
+its own task returns, but workers run in parallel — so the concurrency cap is
+enforced regardless of how many callers are pushing.
+
 ```go
 package main
 
 import (
     "context"
     "fmt"
+    "sync"
+    "sync/atomic"
+    "time"
 
     "github.com/henrylau/fastq"
 )
 
 func main() {
-    // Workers run this handler. Type parameters: input=int, output=string.
-    handler := func(ctx context.Context, n int) (string, error) {
-        return fmt.Sprintf("squared=%d", n*n), nil
+    var inflight, peak atomic.Int32
+
+    handler := func(ctx context.Context, n int) (int, error) {
+        cur := inflight.Add(1)
+        defer inflight.Add(-1)
+
+        // Track the peak number of handlers running at once.
+        for p := peak.Load(); cur > p; p = peak.Load() {
+            if peak.CompareAndSwap(p, cur) {
+                break
+            }
+        }
+
+        time.Sleep(50 * time.Millisecond) // simulate real work
+        return n * n, nil
     }
 
-    q := fastq.NewFastQueue(context.Background(), handler, 4) // 4 workers
+    // Cap concurrency at 4 workers.
+    q := fastq.NewFastQueue(context.Background(), handler, 4)
     defer q.Stop()
 
-    // Synchronous push — blocks until the worker returns.
-    result, err := q.Push(context.Background(), 7, nil)
-    if err != nil {
-        panic(err)
+    const total = 10
+    results := make([]int, total)
+
+    var wg sync.WaitGroup
+    wg.Add(total)
+    for i := 0; i < total; i++ {
+        go func(i int) {
+            defer wg.Done()
+            // PushAndWait blocks until this task's worker returns.
+            r, _ := q.PushAndWait(context.Background(), i)
+            results[i] = r
+        }(i)
     }
-    fmt.Println(result) // squared=49
+    wg.Wait()
+
+    fmt.Println("results:", results)
+    fmt.Println("peak concurrent handlers:", peak.Load(), "(cap=4)")
+    // results: [0 1 4 9 16 25 36 49 64 81]
+    // peak concurrent handlers: 4 (cap=4)
 }
 ```
+
+Even though 10 goroutines called `PushAndWait` at the same moment, at most 4
+handlers ever ran in parallel. Each caller still got its own result back
+synchronously.
 
 ## Usage
 
 ### Synchronous push
 
-`Push` queues a task and blocks until the worker returns its result.
+`PushAndWait` queues a task and blocks until the worker returns its result.
 
 ```go
-out, err := q.Push(ctx, payload, nil)
+out, err := q.PushAndWait(ctx, payload)
 ```
 
 ### Fire-and-forget
@@ -66,7 +103,9 @@ q.WaitEmpty() // blocks until all queued tasks have completed
 
 ### Callback after completion
 
-Pass a callback to `Push` and it runs in its own goroutine after the result is produced. The synchronous return value still fires — the callback is additive.
+`PushWithCallback` queues a task and returns immediately. The callback runs in
+its own goroutine once the worker finishes — use it when you want the result
+without blocking the caller.
 
 ```go
 cb := func(ctx context.Context, result string, err error) {
@@ -76,8 +115,14 @@ cb := func(ctx context.Context, result string, err error) {
     }
     metrics.Record(result)
 }
-_, _ = q.Push(ctx, payload, cb)
+if err := q.PushWithCallback(ctx, payload, cb); err != nil {
+    log.Printf("queue refused task: %v", err)
+}
 ```
+
+Tasks pushed via `PushWithCallback` and `PushWithoutResult` are enqueued in
+the order their `Push*` calls returned, even though the actual sends happen on
+internal goroutines.
 
 ### Pause and resume
 
@@ -91,12 +136,14 @@ q.Resume()
 
 ### Per-task context
 
-If `ctx` passed to `Push` is non-nil, the handler receives a context derived from it (and cancelled if the queue stops). This lets the caller carry deadlines, tracing IDs, etc.
+If `ctx` passed to a `Push*` call is non-nil, the handler receives a context
+derived from it (and cancelled if the queue stops). This lets the caller carry
+deadlines, tracing IDs, etc.
 
 ```go
 ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 defer cancel()
-result, err := q.Push(ctx, payload, nil)
+result, err := q.PushAndWait(ctx, payload)
 ```
 
 ### Inspecting state
@@ -115,7 +162,7 @@ q.Failed()    // ...
 
 ### Discarding pending work
 
-`Clear()` drops everything currently in the input buffer (delivering `ErrTaskCancelled` to any waiting `Push` callers). Tasks already being executed by a worker continue.
+`Clear()` drops everything currently in the input buffer (delivering `ErrTaskCancelled` to any waiting `PushAndWait` callers and to `PushWithCallback` callbacks). Tasks already being executed by a worker continue.
 
 ```go
 q.Clear()
@@ -125,9 +172,9 @@ q.Clear()
 
 `Stop()` is the graceful shutdown:
 
-1. Rejects new `Push` calls (`ErrQueueStopped`).
+1. Rejects new `Push*` calls (`ErrQueueStopped`).
 2. Cancels each worker's task context, so handlers that respect `ctx` exit early.
-3. Drains any tasks still in the buffer, delivering `ErrTaskCancelled` to their result channels.
+3. Drains any tasks still in the buffer, delivering `ErrTaskCancelled` to their result channels (or callbacks).
 4. Returns once all workers and pending pushes have settled.
 
 `Stop()` is safe to call multiple times and from any goroutine.
@@ -140,30 +187,12 @@ q.Stop()
 
 | Error | When |
 |---|---|
-| `ErrQueueStopped` | `Push` / `PushWithoutResult` called after `Stop()` started and admission was rejected. |
-| `ErrTaskCancelled` | Task was admitted but never executed (cancelled by `Stop` or `Clear`), or the handler returned a non-nil error after queue shutdown. |
+| `ErrQueueStopped` | Any `Push*` called after `Stop()` started and admission was rejected. |
+| `ErrTaskCancelled` | Task was admitted but never executed (cancelled by `Stop` or `Clear`). Surfaced via the return of `PushAndWait` or the `err` argument of a `PushWithCallback` callback. |
 | handler error | Whatever the handler returned. |
 
-`Push` returns the task's *fate*: a real result, or one of the errors above.
+`PushAndWait` returns the task's *fate*: a real result, or one of the errors above. `PushWithCallback` and `PushWithoutResult` only return `ErrQueueStopped` from admission — task-level errors arrive via the callback or are silently counted as `Failed`.
 
-## Performance
-
-Benchmarks on Apple M2 Pro (Go 1.25, 12 cores), comparing against a hand-written semaphore-bounded goroutine pattern with the same concurrency cap:
-
-| | ns/op | allocs/op |
-|---|---|---|
-| Bare goroutine (unbounded) | ~320 | 2 |
-| Semaphore-bounded goroutine | ~420–620 | 2 |
-| `PushWithoutResult` | ~640–1300 | 4 |
-| `Push` (with result channel) | ~1700–2200 | 8–9 |
-
-The overhead pays for: pause/resume, stats, cancellable in-flight tasks, graceful `Stop`, and per-task callbacks. For real workloads (≥10 µs per task) the coordination cost is noise.
-
-Run them yourself:
-
-```
-go test -bench=. -benchmem -run=^$ ./...
-```
 
 ## API summary
 
@@ -172,7 +201,8 @@ func NewFastQueue[T, R any](ctx context.Context,
     handler func(context.Context, T) (R, error),
     numberOfWorkers int) *FastQueue[T, R]
 
-func (q *FastQueue[T, R]) Push(ctx context.Context, payload T, cb Callback[R]) (R, error)
+func (q *FastQueue[T, R]) PushAndWait(ctx context.Context, payload T) (R, error)
+func (q *FastQueue[T, R]) PushWithCallback(ctx context.Context, payload T, cb Callback[R]) error
 func (q *FastQueue[T, R]) PushWithoutResult(ctx context.Context, payload T) error
 
 func (q *FastQueue[T, R]) WaitEmpty()
