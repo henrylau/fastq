@@ -728,10 +728,11 @@ func TestStop(t *testing.T) {
 				}()
 			}
 
-			q.Stop()
-
 			mustFinish(t, 3*time.Second,
-				fmt.Sprintf("trial %d: pushers return", trial), pushWg.Wait)
+				fmt.Sprintf("trial %d: pushers return", trial), func() {
+					q.Stop()
+					pushWg.Wait()
+				})
 
 			if p := q.Pending(); p != 0 {
 				t.Fatalf("trial %d: %d task(s) stranded after Stop", trial, p)
