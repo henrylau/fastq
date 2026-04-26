@@ -223,11 +223,18 @@ func (q *FastQueue[T, R]) PushWithCallback(ctx context.Context, payload T, callb
 		if prev != nil {
 			<-prev
 		}
-		close(myPushTask)
 
-		select {
-		case q.input <- TaskInput[T, R]{Payload: payload, Result: resultChan, Context: ctx}:
-		case <-q.stoppedChan:
+		var stopped bool
+		func() {
+			defer close(myPushTask)
+			select {
+			case q.input <- TaskInput[T, R]{Payload: payload, Result: resultChan, Context: ctx}:
+			case <-q.stoppedChan:
+				stopped = true
+			}
+		}()
+
+		if stopped {
 			q.wgQueue.Done()
 			atomic.AddInt32(&q.pending, -1)
 			atomic.AddInt32(&q.failed, 1)
