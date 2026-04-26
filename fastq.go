@@ -20,8 +20,6 @@ type Result[R any] struct {
 	Error  error
 }
 
-var ErrTaskCancelled = errors.New("task cancelled")
-
 type QueueStats struct {
 	Pending   int
 	Completed int
@@ -30,8 +28,6 @@ type QueueStats struct {
 }
 
 type QueueStatus string
-
-var ErrQueueStopped = errors.New("queue is stopped")
 
 const (
 	Running QueueStatus = "Running"
@@ -68,6 +64,10 @@ type FastQueue[T any, R any] struct {
 	paused     bool
 	pausedCond *sync.Cond
 }
+
+// error constants
+var ErrTaskCancelled = errors.New("task cancelled")
+var ErrQueueStopped = errors.New("queue stopped")
 
 func NewFastQueue[T any, R any](ctx context.Context, handler func(ctx context.Context, payload T) (R, error), numberOfWorkers int) *FastQueue[T, R] {
 	workerContext, cancel := context.WithCancel(context.Background())
