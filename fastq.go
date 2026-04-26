@@ -146,7 +146,6 @@ func (q *FastQueue[T, R]) worker(workerID int) {
 
 			// remove the cancel function
 			stop()
-			taskCancel()
 
 			q.wgQueue.Done()
 			atomic.AddInt32(&q.pending, -1)
