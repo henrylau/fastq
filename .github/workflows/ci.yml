@@ -22,8 +22,7 @@ jobs:
         run: go build ./...
 
       - name: Test with coverage
-        run: go test -race -coverprofile=coverage.out -covermode=atomic ./...
-
+        run: go test -race -v -timeout 30s -count=1 -coverprofile=coverage.out -covermode=atomic  ./...
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
