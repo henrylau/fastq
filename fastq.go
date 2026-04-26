@@ -108,7 +108,11 @@ var ErrQueueStopped = errors.New("queue stopped")
 // a Push* call passes a nil context. handler is invoked once per task; its
 // returned (R, error) is delivered to the pushing API.
 //
-// Call Stop to release worker goroutines.
+// NewFastQueue creates a FastQueue that invokes the given handler using a fixed pool of workers
+// sized to numberOfWorkers.
+// The provided ctx is stored as the queue's default parent context for task execution; individual
+// task pushes may supply a different per-task context.
+// Call Stop to perform a graceful shutdown and release the worker goroutines.
 func NewFastQueue[T any, R any](ctx context.Context, handler func(ctx context.Context, payload T) (R, error), numberOfWorkers int) *FastQueue[T, R] {
 	workerContext, cancel := context.WithCancel(context.Background())
 

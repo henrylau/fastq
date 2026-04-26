@@ -25,6 +25,8 @@ type ApiResponse struct {
 	result string
 }
 
+// apiCall simulates performing an API request using the provided parameters and returns a successful response.
+// The provided context is currently ignored; the function always returns ApiResponse{result: "success"} and a nil error.
 func apiCall(ctx context.Context, task ApiParams) (ApiResponse, error) {
 	// simulate api call
 	time.Sleep(1 * time.Second)
@@ -38,6 +40,8 @@ const maxConcurrent = 2
 // at most maxConcurrent invocations run concurrently.
 var ApiCall = fastq.NewFastQueue(context.Background(), apiCall, maxConcurrent)
 
+// main demonstrates submitting multiple tasks to a FastQueue that limits concurrent
+// executions, waits for each task's result, and blocks until the queue is fully drained.
 func main() {
 	waitGroup := sync.WaitGroup{}
 	waitGroup.Add(10)
