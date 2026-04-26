@@ -1,5 +1,10 @@
 # fastq
 
+[![Build and Test](https://github.com/henrylau/fastq/actions/workflows/ci.yml/badge.svg)](https://github.com/henrylau/fastq/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/henrylau/fastq/branch/main/graph/badge.svg)](https://codecov.io/gh/henrylau/fastq)
+[![Go Report Card](https://goreportcard.com/badge/github.com/henrylau/fastq)](https://goreportcard.com/report/github.com/henrylau/fastq)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+
 A small, generic worker queue for Go. Bound concurrency to a fixed number of workers, push tasks synchronously or fire-and-forget, pause/resume, and shut down cleanly without losing in-flight work.
 
 
