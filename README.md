@@ -129,6 +129,56 @@ Tasks pushed via `PushWithCallback` and `PushWithoutResult` are enqueued in
 the order their `Push*` calls returned, even though the actual sends happen on
 internal goroutines.
 
+### Concurrency-limited function wrapper
+
+A queue with the function as its handler turns the function into a
+concurrency-limited callable: no matter how many goroutines call it, at
+most N invocations run in parallel. Callers use `PushAndWait`, which
+blocks until their slot runs and returns the function's result.
+
+```go
+type ApiParams struct {
+    param1 string
+    param2 string
+}
+
+type ApiResponse struct {
+    result string
+}
+
+func apiCall(ctx context.Context, task ApiParams) (ApiResponse, error) {
+    // ... real work, e.g. HTTP request ...
+    time.Sleep(1 * time.Second)
+    return ApiResponse{result: "success"}, nil
+}
+
+const maxConcurrent = 2
+
+// At most 2 apiCall invocations run in parallel, regardless of caller count.
+var ApiCall = fastq.NewFastQueue(context.Background(), apiCall, maxConcurrent)
+
+func main() {
+    var wg sync.WaitGroup
+    wg.Add(10)
+    for i := 0; i < 10; i++ {
+        go func(i int) {
+            defer wg.Done()
+            res, err := ApiCall.PushAndWait(context.Background(),
+                ApiParams{param1: fmt.Sprintf("param1 %d", i)})
+            if err != nil {
+                log.Printf("task %d error: %v", i, err)
+                return
+            }
+            log.Printf("task %d result: %s", i, res.result)
+        }(i)
+    }
+    wg.Wait()
+    ApiCall.WaitEmpty()
+}
+```
+
+Full runnable version: [`examples/concurrent-limit`](examples/concurrent-limit).
+
 ### Pause and resume
 
 Workers stop picking up new tasks once `Pause()` returns. In-flight handlers run to completion. `Resume()` wakes them up.
