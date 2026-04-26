@@ -386,6 +386,7 @@ func (q *FastQueue[T, R]) Status() QueueStats {
 		Pending:   int(atomic.LoadInt32(&q.pending)),
 		Completed: int(atomic.LoadInt32(&q.completed)),
 		Failed:    int(atomic.LoadInt32(&q.failed)),
+		Status:    Running,
 	}
 
 	if q.stopped {
